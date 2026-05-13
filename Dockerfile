@@ -32,9 +32,9 @@ RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 RUN set -e && \
     cd /opt/hermes-agent && \
     echo "Applying web_server_model_options patch..." && \
-    patch -p1 --no-backup-if-diff < patches/web_server_model_options.patch && \
+    patch -p1 -N < patches/web_server_model_options.patch && \
     echo "Applying model_picker_dialog patch..." && \
-    patch -p1 --no-backup-if-diff < patches/model_picker_dialog.patch && \
+    patch -p1 -N < patches/model_picker_dialog.patch && \
     echo "All patches applied successfully."
 
 # Build the web frontend with our patched TypeScript
