@@ -23,6 +23,7 @@ RUN mkdir -p /root/.hermes/{cron,sessions,logs,memories,skills,pairing,hooks,ima
 
 COPY auth_proxy.py /auth_proxy.py
 COPY entrypoint.sh /entrypoint.sh
-RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh \
+    && pip install --no-cache-dir aiohttp
 
 ENTRYPOINT ["/entrypoint.sh"]
