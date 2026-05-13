@@ -66,9 +66,13 @@
 +    setSavingKey(true);
 +    setKeyError(null);
 +    try {
-+      const res = await fetch("/api/env", {
++      const headers: Record<string, string> = { "Content-Type": "application/json" };
++      const token = (window as any).__HERMES_SESSION_TOKEN__;
++      if (token) headers["X-Hermes-Session-Token"] = token;
++      const base = (window as any).__HERMES_BASE_PATH__ || "";
++      const res = await fetch(`${base}/api/env`, {
 +        method: "PUT",
-+        headers: { "Content-Type": "application/json" },
++        headers,
 +        body: JSON.stringify({ key: provider.key_env, value: keyInput.trim() }),
 +      });
 +      if (!res.ok) {
