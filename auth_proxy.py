@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from aiohttp import web, ClientSession, WSMsgType
+from aiohttp import web, ClientSession, WSMsgType, ClientTimeout
 
 HERMES_HOME = "/root/.hermes"
 UPSTREAM = "http://127.0.0.1:9119"
@@ -400,31 +400,47 @@ async def proxy(request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await proxy_ws(request)
 
-    async with ClientSession() as session:
-        url = f"{UPSTREAM}{request.path_qs}"
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "transfer-encoding")}
+    try:
+        async with ClientSession() as session:
+            url = f"{UPSTREAM}{request.path_qs}"
+            headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "transfer-encoding")}
 
-        body = await request.read()
-        async with session.request(
-            request.method,
-            url,
-            headers=headers,
-            data=body,
-            allow_redirects=False,
-        ) as resp:
-            excluded = {"transfer-encoding", "content-encoding", "content-length"}
-            proxy_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
-            content = await resp.read()
-            if (request.method, request.path) in RESTART_PATHS and resp.status < 400:
-                start_gateway()
+            body = await request.read()
+            async with session.request(
+                request.method,
+                url,
+                headers=headers,
+                data=body,
+                allow_redirects=False,
+                timeout=ClientTimeout(total=30),
+            ) as resp:
+                excluded = {"transfer-encoding", "content-encoding", "content-length"}
+                proxy_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
+                content = await resp.read()
+                if (request.method, request.path) in RESTART_PATHS and resp.status < 400:
+                    start_gateway()
 
-            content_type = resp.headers.get("content-type", "")
-            if "text/html" in content_type:
-                html_headers = {k: v for k, v in proxy_headers.items() if k.lower() != "content-type"}
-                html = content.decode("utf-8", errors="replace")
-                html = html.replace("</body>", GATEWAY_WIDGET + "</body>")
-                return web.Response(status=resp.status, headers=html_headers, text=html, content_type="text/html")
-            return web.Response(status=resp.status, headers=proxy_headers, body=content)
+                content_type = resp.headers.get("content-type", "")
+                if "text/html" in content_type:
+                    html_headers = {k: v for k, v in proxy_headers.items() if k.lower() != "content-type"}
+                    html = content.decode("utf-8", errors="replace")
+                    html = html.replace("</body>", GATEWAY_WIDGET + "</body>")
+                    return web.Response(status=resp.status, headers=html_headers, text=html, content_type="text/html")
+                return web.Response(status=resp.status, headers=proxy_headers, body=content)
+    except Exception:
+        # Dashboard not ready yet — return a friendly message
+        return web.Response(
+            status=503,
+            content_type="text/html",
+            text="""<!DOCTYPE html><html><head><meta http-equiv="refresh" content="5"><title>Hermes Agent</title>
+            <style>body{background:#0a0f14;color:#e0f0f0;font-family:sans-serif;display:flex;align-items:center;
+            justify-content:center;height:100vh;margin:0;}.box{text-align:center;}
+            h1{color:#2dd4bf;}.spinner{border:3px solid rgba(45,212,191,0.2);border-top:3px solid #2dd4bf;
+            border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto;}
+            @keyframes spin{to{transform:rotate(360deg)}}</style></head>
+            <body><div class="box"><h1>Hermes Agent</h1><div class="spinner"></div>
+            <p>Dashboard is starting up... please wait.</p><p>This page will auto-refresh.</p></div></body></html>""",
+        )
 
 
 async def on_startup(app):

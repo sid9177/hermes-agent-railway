@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-AUTO_UPDATE="${AUTO_UPDATE:-true}"
+AUTO_UPDATE="${AUTO_UPDATE:-false}"
 
 if [ "$AUTO_UPDATE" = "true" ]; then
   echo "Checking for Hermes updates..."
@@ -27,19 +27,6 @@ touch /root/.hermes/.env
 
 echo "Starting Hermes dashboard on port 9119..."
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open 2>&1 &
-
-# Wait for dashboard to be ready (up to 120 seconds)
-echo "Waiting for dashboard to start..."
-for i in $(seq 1 120); do
-  if curl -sf http://127.0.0.1:9119/ > /dev/null 2>&1; then
-    echo "Dashboard is ready after ${i}s."
-    break
-  fi
-  if [ "$i" -eq 120 ]; then
-    echo "WARNING: Dashboard did not start within 120s, starting proxy anyway."
-  fi
-  sleep 1
-done
 
 echo "Starting auth proxy on port ${PORT:-8080}..."
 exec python /auth_proxy.py
