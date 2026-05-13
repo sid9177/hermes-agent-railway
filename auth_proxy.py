@@ -13,7 +13,8 @@ import time
 from aiohttp import web, ClientSession, WSMsgType, ClientTimeout
 
 HERMES_HOME = "/root/.hermes"
-UPSTREAM = "http://127.0.0.1:9119"
+DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
+UPSTREAM = f"http://127.0.0.1:{DASHBOARD_PORT}"
 USERNAME = os.environ.get("DASHBOARD_USER", "admin")
 PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 SECRET = secrets.token_bytes(32)
@@ -375,7 +376,7 @@ async def proxy_ws(request):
     await ws_client.prepare(request)
 
     async with ClientSession() as session:
-        url = f"ws://127.0.0.1:9119{request.path_qs}"
+        url = f"ws://127.0.0.1:{DASHBOARD_PORT}{request.path_qs}"
         async with session.ws_connect(url) as ws_upstream:
 
             async def forward(src, dst):
