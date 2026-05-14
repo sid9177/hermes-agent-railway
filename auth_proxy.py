@@ -17,7 +17,20 @@ DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 UPSTREAM = f"http://127.0.0.1:{DASHBOARD_PORT}"
 USERNAME = os.environ.get("DASHBOARD_USER", "admin")
 PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
-SECRET = secrets.token_bytes(32)
+
+# Persist auth SECRET so cookies survive sleep/wake cycles when a volume is attached
+_SECRET_PATH = os.path.join(HERMES_HOME, ".proxy_secret")
+if os.path.exists(_SECRET_PATH):
+    with open(_SECRET_PATH, "rb") as f:
+        SECRET = f.read()
+else:
+    SECRET = secrets.token_bytes(32)
+    try:
+        with open(_SECRET_PATH, "wb") as f:
+            f.write(SECRET)
+    except OSError:
+        pass  # No volume — SECRET lost on restart, acceptable
+
 COOKIE = "hermes_auth"
 MAX_AGE = 7 * 86400
 
@@ -277,14 +290,27 @@ async def logout(request):
 
 @web.middleware
 async def auth_middleware(request, handler):
-    if request.path in ("/login", "/logout", "/api/health"):
+    # Unauthenticated paths — skip auth and activity tracking
+    if request.path in ("/login", "/logout", "/api/health", "/api/cron/wake"):
         return await handler(request)
 
+    # Telegram webhook — unauthenticated but counts as real activity
+    if request.path == "/telegram/webhook":
+        return await handler(request)
+
+    # Require auth for everything else
     token = request.cookies.get(COOKIE)
     if not token or not check_token(token):
         if request.path.startswith("/api/"):
             raise web.HTTPUnauthorized()
         raise web.HTTPFound("/login")
+
+    # Track real user activity (not polling endpoints)
+    if request.method == "GET" and request.path in POLL_PATHS:
+        # Polling endpoints don't count as real activity
+        pass
+    else:
+        record_real_activity(request)
 
     return await handler(request)
 
@@ -309,6 +335,29 @@ RESTART_PATHS = {
     ("DELETE", "/api/env"),
 }
 
+# --- Activity-aware idle detection ---
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "30")) * 60
+GATEWAY_POLL_INTERVAL = int(os.environ.get("GATEWAY_POLL_INTERVAL", "60"))
+
+# Paths that are considered "polling" — not real user activity
+POLL_PATHS = {"/api/status", "/api/sessions", "/api/gateway/status"}
+
+# Timestamp of the last real (non-polling) user activity
+last_real_activity = time.time()
+
+
+def record_real_activity(request):
+    """Record a real user activity and return whether we were previously idle."""
+    global last_real_activity
+    was_idle = time.time() - last_real_activity > IDLE_TIMEOUT_SECONDS
+    last_real_activity = time.time()
+    return was_idle
+
+
+def is_idle():
+    """Check if the proxy is in idle mode (no real activity for IDLE_TIMEOUT_SECONDS)."""
+    return time.time() - last_real_activity > IDLE_TIMEOUT_SECONDS
+
 
 def volume_attached():
     return os.path.ismount(HERMES_HOME)
@@ -320,12 +369,66 @@ async def restart_gateway(request):
 
 
 async def gateway_status(request):
+    if is_idle():
+        return web.Response(status=204)
     running = gateway_process is not None and gateway_process.poll() is None
     return web.json_response({
         "running": running,
         "volume": volume_attached(),
     })
 
+
+async def idle_status(request):
+    """Return idle state so the client widget can adjust its polling behavior."""
+    return web.json_response({
+        "idle": is_idle(),
+        "idle_timeout_seconds": IDLE_TIMEOUT_SECONDS,
+    })
+
+
+async def cron_wake(request):
+    """Lightweight endpoint to wake the container for cron jobs.
+    Always returns 200 immediately. Resets activity timer."""
+    record_real_activity(request)
+    return web.json_response({
+        "status": "awake",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+
+
+async def telegram_webhook(request):
+    """Proxy Telegram webhook requests to the Hermes gateway.
+    This endpoint is unauthenticated (Telegram uses its own secret token
+    verification) but counts as real activity to prevent idle sleep
+    during active conversations."""
+    record_real_activity(request)
+    try:
+        async with ClientSession() as session:
+            url = f"{UPSTREAM}{request.path_qs}"
+            headers = {k: v for k, v in request.headers.items()
+                       if k.lower() not in ("host", "transfer-encoding")}
+            body = await request.read()
+            async with session.request(
+                request.method,
+                url,
+                headers=headers,
+                data=body,
+                allow_redirects=False,
+                timeout=ClientTimeout(total=30),
+            ) as resp:
+                excluded = {"transfer-encoding", "content-encoding", "content-length"}
+                proxy_headers = {k: v for k, v in resp.headers.items()
+                                 if k.lower() not in excluded}
+                content = await resp.read()
+                return web.Response(status=resp.status, headers=proxy_headers, body=content)
+    except Exception:
+        # Gateway not ready yet — accept the webhook and let Telegram retry
+        # Returning 200 prevents Telegram from retrying this particular update,
+        # which is the desired behavior during cold starts.
+        return web.Response(status=200, text="accepted")
+
+
+GATEWAY_WIDGET_JS_CONFIG = f"var POLL_MS = {GATEWAY_POLL_INTERVAL * 1000};"
 
 GATEWAY_WIDGET = """
 <div id="gw-widget" style="position:fixed;bottom:20px;right:20px;z-index:99999;
@@ -340,29 +443,102 @@ GATEWAY_WIDGET = """
         border-radius:5px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer;">Restart</button>
     </div>
     <div id="gw-vol" style="display:none;font-size:11px;padding-top:4px;border-top:1px solid rgba(45,212,191,0.1);"></div>
+    <div id="gw-conn" style="display:none;font-size:11px;padding-top:4px;border-top:1px solid rgba(45,212,191,0.1);color:#fbbf24;"></div>
   </div>
 </div>
 <script>
-function gwStatus(){
-  fetch('/api/gateway/status').then(r=>r.json()).then(d=>{
-    document.getElementById('gw-dot').style.background=d.running?'#4ade80':'#ef4444';
-    document.getElementById('gw-label').textContent=d.running?'Gateway running':'Gateway stopped';
-    var vol=document.getElementById('gw-vol');
-    vol.style.display='block';
-    if(d.volume){
-      vol.innerHTML='<span style="color:#4ade80;">&#x2713;</span> <span style="color:#7899aa;">Volume attached</span>';
-    }else{
-      vol.innerHTML='<span style="color:#fbbf24;">&#x26A0;</span> <span style="color:#fbbf24;">No volume \u2014 data will not persist</span>';
+(function(){
+  """ + GATEWAY_WIDGET_JS_CONFIG + """
+  var IDLE_CHECK_MS = 300000;
+  var USER_IDLE_MS = 300000;
+  var _pollTimer = null;
+  var _lastActivity = Date.now();
+  var _userIdle = false;
+  var _serverIdle = false;
+  var _wasDisconnected = false;
+
+  function onActivity() {
+    _lastActivity = Date.now();
+    if (_userIdle || _serverIdle) {
+      _userIdle = false;
+      _serverIdle = false;
+      schedulePoll(POLL_MS);
+      gwStatus();
     }
-  }).catch(()=>{});
-}
-function gwRestart(){
-  var b=document.getElementById('gw-btn');b.textContent='Restarting...';b.disabled=true;
-  fetch('/api/gateway/restart',{method:'POST'}).then(()=>{
-    setTimeout(()=>{b.textContent='Restart';b.disabled=false;gwStatus();},3000);
-  }).catch(()=>{b.textContent='Restart';b.disabled=false;});
-}
-gwStatus();setInterval(gwStatus,10000);
+  }
+  document.addEventListener('mousemove', onActivity, {passive:true});
+  document.addEventListener('keydown', onActivity, {passive:true});
+  document.addEventListener('scroll', onActivity, {passive:true});
+  document.addEventListener('touchstart', onActivity, {passive:true});
+
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) {
+      clearTimeout(_pollTimer);
+    } else {
+      onActivity();
+    }
+  });
+
+  function schedulePoll(delay) {
+    clearTimeout(_pollTimer);
+    _pollTimer = setTimeout(function() {
+      var elapsed = Date.now() - _lastActivity;
+      if (elapsed > USER_IDLE_MS) _userIdle = true;
+      gwStatus();
+      var next = (_userIdle || _serverIdle) ? IDLE_CHECK_MS : POLL_MS;
+      schedulePoll(next);
+    }, delay);
+  }
+
+  function gwStatus() {
+    fetch('/api/gateway/status').then(function(r) {
+      if (r.status === 204) {
+        _serverIdle = true;
+        return null;
+      }
+      _serverIdle = false;
+      if (_wasDisconnected) {
+        _wasDisconnected = false;
+        hideConn();
+      }
+      return r.json();
+    }).then(function(d) {
+      if (!d) return;
+      document.getElementById('gw-dot').style.background = d.running ? '#4ade80' : '#ef4444';
+      document.getElementById('gw-label').textContent = d.running ? 'Gateway running' : 'Gateway stopped';
+      var vol = document.getElementById('gw-vol');
+      vol.style.display = 'block';
+      if (d.volume) {
+        vol.innerHTML = '<span style="color:#4ade80;">\\u2713</span> <span style="color:#7899aa;">Volume attached</span>';
+      } else {
+        vol.innerHTML = '<span style="color:#fbbf24;">\\u26A0</span> <span style="color:#fbbf24;">No volume \\u2014 data will not persist</span>';
+      }
+    }).catch(function() {
+      _wasDisconnected = true;
+      showConn('Reconnecting...');
+    });
+  }
+
+  function gwRestart() {
+    var b = document.getElementById('gw-btn');
+    b.textContent = 'Restarting...'; b.disabled = true;
+    fetch('/api/gateway/restart', {method:'POST'}).then(function() {
+      setTimeout(function() { b.textContent = 'Restart'; b.disabled = false; gwStatus(); }, 3000);
+    }).catch(function() { b.textContent = 'Restart'; b.disabled = false; });
+  }
+
+  function showConn(msg) {
+    var el = document.getElementById('gw-conn');
+    if (el) { el.style.display = 'block'; el.textContent = msg; }
+  }
+  function hideConn() {
+    var el = document.getElementById('gw-conn');
+    if (el) { el.style.display = 'none'; }
+  }
+
+  schedulePoll(POLL_MS);
+  gwStatus();
+})();
 </script>
 """
 
@@ -455,8 +631,11 @@ def create_app():
     app.router.add_post("/login", login_post)
     app.router.add_get("/logout", logout)
     app.router.add_get("/api/health", health)
+    app.router.add_get("/api/cron/wake", cron_wake)
+    app.router.add_get("/api/idle", idle_status)
     app.router.add_post("/api/gateway/restart", restart_gateway)
     app.router.add_get("/api/gateway/status", gateway_status)
+    app.router.add_route("*", "/telegram/webhook", telegram_webhook)
     app.router.add_route("*", "/{path_info:.*}", proxy)
     return app
 

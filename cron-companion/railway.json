@@ -1,0 +1,8 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "cronSchedule": "*/5 * * * *",
+    "startCommand": "curl -sf ${HERMES_URL}/api/cron/wake",
+    "restartPolicyType": "NEVER"
+  }
+}
