@@ -21,84 +21,20 @@ ws_text = ws.read_text(encoding="utf-8")
 # Replace the get_model_options function body.
 # Find: "providers = list_authenticated_providers(" through the return dict.
 old_ws_block = """\
-        providers = list_authenticated_providers(
-            current_provider=current_provider,
-            current_base_url=current_base_url,
-            current_model=current_model,
-            user_providers=user_providers,
-            custom_providers=custom_providers,
-            max_models=50,
-        )
-        return {
-            "providers": providers,
-            "model": current_model,
-            "provider": current_provider,
-        }"""
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        return build_models_payload(load_picker_context(), max_models=50)"""
 
 new_ws_block = """\
-        authenticated = list_authenticated_providers(
-            current_provider=current_provider,
-            current_base_url=current_base_url,
-            current_model=current_model,
-            user_providers=user_providers,
-            custom_providers=custom_providers,
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        return build_models_payload(
+            load_picker_context(),
             max_models=50,
-        )
-
-        # Mark authenticated providers and build lookup by slug
-        from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
-        from hermes_cli.auth import PROVIDER_REGISTRY as _auth_reg
-
-        authed_map: dict = {}
-        authed_extra: list = []
-        canonical_slugs = {e.slug for e in CANONICAL_PROVIDERS}
-        for p in authenticated:
-            p["authenticated"] = True
-            authed_map[p["slug"]] = p
-            if p["slug"] not in canonical_slugs:
-                authed_extra.append(p)
-
-        # Build final list in CANONICAL_PROVIDERS order, merging auth data
-        ordered: list = []
-        for entry in CANONICAL_PROVIDERS:
-            if entry.slug in authed_map:
-                ordered.append(authed_map[entry.slug])
-            else:
-                pconfig = _auth_reg.get(entry.slug)
-                auth_type = pconfig.auth_type if pconfig else "api_key"
-                key_env = (
-                    pconfig.api_key_env_vars[0]
-                    if (pconfig and pconfig.api_key_env_vars)
-                    else ""
-                )
-                if auth_type == "api_key" and key_env:
-                    warning = f"paste {key_env} to activate"
-                else:
-                    warning = f"run `hermes model` to configure ({auth_type})"
-                ordered.append(
-                    {
-                        "slug": entry.slug,
-                        "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
-                        "is_current": entry.slug == current_provider,
-                        "is_user_defined": False,
-                        "models": [],
-                        "total_models": 0,
-                        "source": "built-in",
-                        "authenticated": False,
-                        "auth_type": auth_type,
-                        "key_env": key_env,
-                        "warning": warning,
-                    }
-                )
-
-        # Append user-defined/custom providers not in canonical list
-        ordered.extend(authed_extra)
-
-        return {
-            "providers": ordered,
-            "model": current_model,
-            "provider": current_provider,
-        }"""
+            include_unconfigured=True,
+            picker_hints=True,
+            canonical_order=True,
+        )"""
 
 if old_ws_block not in ws_text:
     print("ERROR: Could not find target block in web_server.py")
