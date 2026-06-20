@@ -90,11 +90,12 @@ Internet -> Railway -> Auth Proxy (cookie login + activity tracking + idle detec
                             |
                             +-> Hermes Dashboard (port 9199)
                             +-> Messaging Gateway (Telegram webhook / polling)
+                            +-> Telegram Adapter (port 8443, webhook receiver when TELEGRAM_WEBHOOK_URL is set)
                             +-> /api/health (unauthenticated, Railway health checks)
                             +-> /api/cron/wake (unauthenticated, companion cron trigger)
                             +-> /api/gateway/status (authenticated, idle-aware: returns 204 when idle)
                             +-> /api/idle (authenticated, check idle state)
-                            +-> /telegram/webhook (unauthenticated, Telegram wake-on-message)
+                            +-> /telegram/webhook (unauthenticated, proxied to Telegram Adapter on port 8443)
 ```
 
 ## Resources
