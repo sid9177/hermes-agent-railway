@@ -329,12 +329,6 @@ def start_gateway():
     gateway_process = subprocess.Popen(["hermes", "gateway", "run"])
 
 
-RESTART_PATHS = {
-    ("PUT", "/api/config"),
-    ("PUT", "/api/env"),
-    ("DELETE", "/api/env"),
-}
-
 # --- Activity-aware idle detection ---
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "30")) * 60
 GATEWAY_POLL_INTERVAL = int(os.environ.get("GATEWAY_POLL_INTERVAL", "60"))
@@ -594,8 +588,12 @@ async def proxy(request):
                 excluded = {"transfer-encoding", "content-encoding", "content-length"}
                 proxy_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
                 content = await resp.read()
-                if (request.method, request.path) in RESTART_PATHS and resp.status < 400:
-                    start_gateway()
+                # NOTE: The dashboard now manages gateway restarts itself via
+                # /api/actions/gateway-restart/* endpoints. Calling start_gateway()
+                # here on PUT /api/env or PUT /api/config caused a race with the
+                # dashboard's own restart, producing "Port 8644 already in use"
+                # errors (two gateway processes fighting over the webhook port).
+                # The manual restart is still available via POST /api/gateway/restart.
 
                 content_type = resp.headers.get("content-type", "")
                 if "text/html" in content_type:
