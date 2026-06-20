@@ -397,36 +397,53 @@ async def telegram_webhook(request):
     TELEGRAM_WEBHOOK_URL is set. Railway only exposes the auth proxy's port,
     so we forward /telegram/webhook requests to the adapter's internal port.
 
+    During cold starts, the adapter may not be ready yet. We retry for up to
+    45 seconds before giving up, so the message isn't lost.
+
     This endpoint is unauthenticated (Telegram uses its own secret token
     verification) but counts as real activity to prevent idle sleep
     during active conversations."""
     record_real_activity(request)
     telegram_webhook_port = int(os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443"))
     upstream = f"http://127.0.0.1:{telegram_webhook_port}"
-    try:
-        async with ClientSession() as session:
-            url = f"{upstream}{request.path_qs}"
-            headers = {k: v for k, v in request.headers.items()
-                       if k.lower() not in ("host", "transfer-encoding")}
-            body = await request.read()
-            async with session.request(
-                request.method,
-                url,
-                headers=headers,
-                data=body,
-                allow_redirects=False,
-                timeout=ClientTimeout(total=30),
-            ) as resp:
-                excluded = {"transfer-encoding", "content-encoding", "content-length"}
-                proxy_headers = {k: v for k, v in resp.headers.items()
-                                 if k.lower() not in excluded}
-                content = await resp.read()
-                return web.Response(status=resp.status, headers=proxy_headers, body=content)
-    except Exception:
-        # Gateway not ready yet — accept the webhook and let Telegram retry
-        # Returning 200 prevents Telegram from retrying this particular update,
-        # which is the desired behavior during cold starts.
-        return web.Response(status=200, text="accepted")
+
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in ("host", "transfer-encoding")}
+    body = await request.read()
+
+    # Retry for up to 45 seconds during cold starts — the Telegram adapter
+    # takes ~30s to start after the container wakes. Returning a non-2xx
+    # status would make Telegram retry, but Telegram's retry interval is
+    # exponential and can delay the message by minutes. Holding the
+    # connection open and retrying internally gives the fastest delivery.
+    import asyncio
+    max_attempts = 15
+    for attempt in range(max_attempts):
+        try:
+            async with ClientSession() as session:
+                url = f"{upstream}{request.path_qs}"
+                async with session.request(
+                    request.method,
+                    url,
+                    headers=headers,
+                    data=body,
+                    allow_redirects=False,
+                    timeout=ClientTimeout(total=10),
+                ) as resp:
+                    excluded = {"transfer-encoding", "content-encoding", "content-length"}
+                    proxy_headers = {k: v for k, v in resp.headers.items()
+                                     if k.lower() not in excluded}
+                    content = await resp.read()
+                    return web.Response(status=resp.status, headers=proxy_headers, body=content)
+        except Exception:
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(3)
+            else:
+                # All retries exhausted — return 200 so Telegram doesn't
+                # retry with exponential backoff (which would delay the
+                # message further). The message is lost, but this only
+                # happens if the gateway fails to start within 45 seconds.
+                return web.Response(status=200, text="accepted")
 
 
 GATEWAY_WIDGET_JS_CONFIG = f"var POLL_MS = {GATEWAY_POLL_INTERVAL * 1000};"
