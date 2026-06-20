@@ -391,14 +391,21 @@ async def cron_wake(request):
 
 
 async def telegram_webhook(request):
-    """Proxy Telegram webhook requests to the Hermes gateway.
+    """Proxy Telegram webhook requests to the Hermes gateway's Telegram adapter.
+
+    The Telegram adapter runs its own HTTP server (default port 8443) when
+    TELEGRAM_WEBHOOK_URL is set. Railway only exposes the auth proxy's port,
+    so we forward /telegram/webhook requests to the adapter's internal port.
+
     This endpoint is unauthenticated (Telegram uses its own secret token
     verification) but counts as real activity to prevent idle sleep
     during active conversations."""
     record_real_activity(request)
+    telegram_webhook_port = int(os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443"))
+    upstream = f"http://127.0.0.1:{telegram_webhook_port}"
     try:
         async with ClientSession() as session:
-            url = f"{UPSTREAM}{request.path_qs}"
+            url = f"{upstream}{request.path_qs}"
             headers = {k: v for k, v in request.headers.items()
                        if k.lower() not in ("host", "transfer-encoding")}
             body = await request.read()
