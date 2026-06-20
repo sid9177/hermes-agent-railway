@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Patch Hermes Agent to show all providers (not just authenticated ones)
-in the web UI model picker, and allow API key entry for unauthenticated providers.
+Patch Hermes Agent's ModelPickerDialog.tsx to add API key entry UI for
+unauthenticated providers, so users can activate them from the dashboard
+instead of editing .env manually.
+
+NOTE: The backend half of this feature (web_server.py returning
+include_unconfigured=True) was merged upstream and is no longer patched here.
+Only the frontend activation UI remains.
 
 Uses string replacement instead of unified diff patches for robustness
 against upstream whitespace changes.
@@ -13,53 +18,7 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("HERMES_AGENT_ROOT", "/opt/hermes-agent"))
 
-# ── Patch 1: web_server.py — return all canonical providers ──────────────────
-
-ws = ROOT / "hermes_cli" / "web_server.py"
-ws_text = ws.read_text(encoding="utf-8")
-
-# Replace the get_model_options function body.
-# Find: "providers = list_authenticated_providers(" through the return dict.
-old_ws_block = """\
-        from hermes_cli.inventory import build_models_payload, load_picker_context
-
-        return build_models_payload(load_picker_context(), max_models=50)"""
-
-new_ws_block = """\
-        from hermes_cli.inventory import build_models_payload, load_picker_context
-
-        return build_models_payload(
-            load_picker_context(),
-            max_models=50,
-            include_unconfigured=True,
-            picker_hints=True,
-            canonical_order=True,
-        )"""
-
-if old_ws_block not in ws_text:
-    print("ERROR: Could not find target block in web_server.py")
-    print("The upstream code may have changed. Manual patching required.")
-    sys.exit(1)
-
-ws_text = ws_text.replace(old_ws_block, new_ws_block)
-
-# Update docstring
-ws_text = ws_text.replace(
-    '"""Return authenticated providers + their curated model lists.\n\n    '
-    'REST equivalent of the ``model.options`` JSON-RPC on tui_gateway, so the\n    '
-    'dashboard Models page can render the picker without a live chat session.\n    '
-    'The response shape matches ``model.options`` 1:1 so ``ModelPickerDialog``\n    '
-    'can share the same types.\n    """',
-    '"""Return all providers (authenticated + unauthenticated) with auth metadata.\n\n    '
-    'REST equivalent of the ``model.options`` JSON-RPC on tui_gateway.\n    '
-    'Includes unauthenticated canonical providers so the dashboard Models page\n    '
-    'can render the full picker and prompt for API keys.\n    """',
-)
-
-ws.write_text(ws_text, encoding="utf-8")
-print("OK Patched web_server.py")
-
-# ── Patch 2: ModelPickerDialog.tsx ───────────────────────────────────────────
+# ── Patch: ModelPickerDialog.tsx ───────────────────────────────────────────
 
 tsx = ROOT / "web" / "src" / "components" / "ModelPickerDialog.tsx"
 tsx_text = tsx.read_text(encoding="utf-8")
@@ -176,11 +135,21 @@ if old_effect not in tsx_text:
 
 tsx_text = tsx_text.replace(old_effect, new_code)
 
-# 2e. Add submitApiKey and handleProviderSelect before the return statement
-tsx_text = tsx_text.replace(
-    "    }\n  };\n\n  return (",
-    """\
-    }
+# 2e. Add submitApiKey and handleProviderSelect before the return statement.
+# Upstream now has a `confirm()` function + portal comment block before `return (`,
+# so we anchor on the portal comment which is stable.
+old_pre_return = """\
+  const confirm = () => {
+    if (!canConfirm) return;
+    void applySelection();
+  };
+
+  // Portal to document.body: the main dashboard column in App.tsx is"""
+
+new_pre_return = """\
+  const confirm = () => {
+    if (!canConfirm) return;
+    void applySelection();
   };
 
   const submitApiKey = async (provider: ModelOptionProvider) => {
@@ -228,15 +197,22 @@ tsx_text = tsx_text.replace(
     setSelectedModel("");
   };
 
-  return (""",
-)
+  // Portal to document.body: the main dashboard column in App.tsx is"""
 
-# 2f. Change ProviderColumn props in JSX
+if old_pre_return not in tsx_text:
+    print("ERROR: Could not find confirm() + portal comment block in ModelPickerDialog.tsx")
+    print("The upstream code may have changed. Manual patching required.")
+    sys.exit(1)
+
+tsx_text = tsx_text.replace(old_pre_return, new_pre_return)
+
+# 2f. Change ProviderColumn props in JSX.
+# Upstream renamed `providers` -> `filteredProviders` and `needle` -> `trimmedQuery`.
 tsx_text = tsx_text.replace(
     """\
             total={providers.length}
             selectedSlug={selectedSlug}
-            query={needle}
+            query={trimmedQuery}
             onSelect={(slug) => {
               setSelectedSlug(slug);
               setSelectedModel("");
@@ -244,7 +220,7 @@ tsx_text = tsx_text.replace(
     """\
             total={providers.length}
             selectedSlug={selectedSlug}
-            query={needle}
+            query={trimmedQuery}
             activatingSlug={activatingSlug}
             onSelect={handleProviderSelect}
             onActivateSubmit={submitApiKey}
@@ -320,8 +296,8 @@ tsx_text = tsx_text.replace(
 )
 
 # 2i. Add activation UI and unauthenticated styling in the provider list
-# Use a regex-based replacement for the providers.map block since
-# the exact indentation can vary.
+# Use a regex-based replacement for flexibility against upstream whitespace/class changes.
+# Upstream now uses `text-text-secondary` instead of `text-muted-foreground/80`.
 old_map_pattern = (
     r'\{providers\.map\(\(p\) => \{\s*'
     r'const active = p\.slug === selectedSlug;\s*'
@@ -339,8 +315,9 @@ old_map_pattern = (
     r'<span className="font-medium truncate">\{p\.name\}</span>\s*'
     r'\{p\.is_current && <CurrentTag />\}\s*'
     r'</div>\s*'
-    r'<div className="text-\[0\.65rem\] text-muted-foreground/80 font-mono truncate">\s*'
-    r'\{p\.slug\} · \{p\.total_models \?\? p\.models\?\.length \?\? 0\} models\}\s*'  # approximate
+    # Match either the old or new secondary text class
+    r'<div className="text-\[0\.65rem\] (?:text-muted-foreground/80|text-text-secondary) font-mono truncate">\s*'
+    r'\{p\.slug\} · \{p\.total_models \?\? p\.models\?\.length \?\? 0\} models\}\s*'
     r'</div>\s*'
     r'</div>\s*'
     r'</ListItem>\s*'
